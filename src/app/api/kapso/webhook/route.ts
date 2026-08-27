@@ -1,12 +1,21 @@
 import { NextResponse } from 'next/server';
+import { getBusinessKnowledge } from '@/config/business';
+import { decisionOutcome } from '@/lib/decision/contract';
+import { preflight, resolveDecisionEngine } from '@/lib/decision/engine';
 import { getEnv } from '@/lib/env';
 import { sendKapsoText } from '@/lib/kapso';
-import { matchPredeterminedResponse } from '@/lib/matcher';
 import { parseKapsoEvent } from '@/lib/provenance';
 import { verifyKapsoSignature } from '@/lib/security';
 import { createStore } from '@/lib/store';
 
 export const runtime = 'nodejs';
+
+/**
+ * Presupuesto total de la invocación. Tiene que cubrir Supabase, el motor de
+ * decisión y el envío a Kapso, y quedar holgadamente por debajo de los 10
+ * segundos que tarda Kapso en lanzar su primer reintento.
+ */
+export const maxDuration = 30;
 
 export async function POST(request: Request): Promise<Response> {
   const rawBody = await request.text();
@@ -18,6 +27,7 @@ export async function POST(request: Request): Promise<Response> {
   try {
     const env = getEnv();
 
+    // La firma se comprueba sobre el cuerpo crudo y antes de interpretarlo.
     if (!verifyKapsoSignature(rawBody, signature, env.kapsoWebhookSecret)) {
       return NextResponse.json({ error: 'invalid_signature' }, { status: 401 });
     }
@@ -30,11 +40,13 @@ export async function POST(request: Request): Promise<Response> {
 
     const payload = JSON.parse(rawBody) as unknown;
     if (typeof payload === 'object' && payload !== null && 'batch' in payload) {
+      // El buffering se diseña en la Fase 2 y no se activa todavía.
       return NextResponse.json({ error: 'buffering_must_be_disabled' }, { status: 422 });
     }
 
     const event = parseKapsoEvent({ eventName, eventId, payload });
     if (event.kind === 'ignore') {
+      // Entregas, lecturas, fallos y envíos propios: ni pausan ni responden.
       return NextResponse.json({ ok: true, ignored: true });
     }
 
@@ -50,31 +62,60 @@ export async function POST(request: Request): Promise<Response> {
         return NextResponse.json({ ok: true, handled: 'human_pause' });
       }
 
-      if (!env.responsesEnabled) {
-        await store.completeEvent(eventId, 'responses_disabled');
+      // Comprobaciones baratas y sin red antes de tocar Supabase o el motor.
+      const knowledge = getBusinessKnowledge();
+      const blocked = preflight({
+        responsesEnabled: env.responsesEnabled,
+        knowledge,
+        incomingText: event.text,
+      });
+      if (blocked) {
+        const detail = blocked.reason === 'responses_disabled' && env.disabledReason
+          ? `${decisionOutcome(blocked)}:${env.disabledReason}`
+          : decisionOutcome(blocked);
+        await store.completeEvent(eventId, detail);
         return NextResponse.json({ ok: true, silent: true });
       }
 
       if (await store.isPaused(event.phone)) {
-        await store.completeEvent(eventId, 'paused');
-        return NextResponse.json({ ok: true, silent: true, reason: 'human_takeover' });
+        await store.completeEvent(eventId, 'silent:human_pause');
+        return NextResponse.json({ ok: true, silent: true });
       }
 
-      const matched = matchPredeterminedResponse(event.text);
-      if (!matched) {
-        await store.completeEvent(eventId, 'unrecognized');
-        return NextResponse.json({ ok: true, silent: true, reason: 'unrecognized' });
+      const engine = resolveDecisionEngine({ timeoutMs: env.openaiTimeoutMs });
+      const decision = await engine.decide({
+        incomingText: event.text,
+        history: [], // Fase 2: ventana corta leída de Supabase.
+        knowledge,
+        clarifyAllowed: true, // Fase 2: depende del historial reciente.
+      });
+
+      if (decision.action === 'silent') {
+        await store.completeEvent(eventId, decisionOutcome(decision));
+        return NextResponse.json({ ok: true, silent: true });
+      }
+
+      // Barrera obligatoria: el dueño pudo contestar mientras el motor decidía.
+      if (await store.isPaused(event.phone)) {
+        await store.completeEvent(eventId, 'silent:human_pause');
+        return NextResponse.json({ ok: true, silent: true });
+      }
+
+      if (!env.kapsoApiKey || !env.kapsoPhoneNumberId) {
+        await store.completeEvent(eventId, 'silent:responses_disabled');
+        return NextResponse.json({ ok: true, silent: true });
       }
 
       await sendKapsoText({
         apiKey: env.kapsoApiKey,
         phoneNumberId: env.kapsoPhoneNumberId,
         to: event.phone,
-        body: matched.response,
+        body: decision.message,
       });
-      await store.completeEvent(eventId, matched.intent);
-      return NextResponse.json({ ok: true, handled: matched.intent });
+      await store.completeEvent(eventId, decisionOutcome(decision));
+      return NextResponse.json({ ok: true, handled: decision.action });
     } catch (error) {
+      // Deja el evento reclamable por el siguiente reintento de Kapso.
       await store.failEvent(eventId);
       throw error;
     }
