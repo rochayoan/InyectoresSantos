@@ -69,7 +69,7 @@ archivos se convierte en un mensaje enviado a un cliente.
 
 ## Estado del proyecto
 
-Fase 1 completada: diseño técnico y estructura segura.
+Fase 2 completada: persistencia recuperable, historial corto y barrera.
 
 El motor activo es `createSilentEngine()`, que calla siempre. OpenAI se
 integra en la Fase 3. El sistema es desplegable y no puede escribirle a nadie.
@@ -78,7 +78,7 @@ integra en la Fase 3. El sistema es desplegable y no puede escribirle a nadie.
 |---|---|
 | 0 · Auditoría | Completada |
 | 1 · Diseño técnico y estructura segura | Completada |
-| 2 · Persistencia, idempotencia recuperable, pausa y barrera | Pendiente |
+| 2 · Persistencia, idempotencia recuperable, pausa y barrera | Completada |
 | 3 · Núcleo OpenAI | Pendiente |
 | 4 · Pruebas de robustez | Pendiente |
 | 5 · Información real del negocio | Pendiente |
@@ -120,8 +120,23 @@ Las pruebas no llaman a ningún servicio externo y no necesitan claves.
 
 - La firma HMAC SHA-256 de Kapso se verifica sobre el cuerpo crudo, con
   comparación en tiempo constante, antes de interpretar el payload.
-- Idempotencia por `X-Idempotency-Key`. Un evento ya entregado nunca se
-  reprocesa; uno fallido o huérfano sí se puede recuperar.
+- Idempotencia por `X-Idempotency-Key`, resuelta dentro de una función SQL
+  atómica. Un evento con entrega registrada nunca se vuelve a tomar; uno
+  fallido, o huérfano con el arrendamiento vencido, sí se recupera.
 - Los registros no incluyen claves, teléfonos, textos de clientes ni payloads
   del proveedor: solo etiquetas cortas de desenlace.
 - El historial guarda una ventana corta y se purga a las 24 horas.
+
+### Límite conocido de la entrega
+
+Entre que Kapso acepta un mensaje y que se graba su `sent_message_id` hay una
+ventana breve. Si la invocación muere justo ahí, el evento queda sin entrega
+registrada y un reintento posterior de Kapso, una vez vencido el
+arrendamiento, podría reenviar el mismo mensaje.
+
+La ventana se acota poniendo el arrendamiento por encima de `maxDuration`
+(45 s frente a 30 s) y grabando la entrega inmediatamente después del envío,
+pero no se cierra del todo: la API de envío de Kapso no expone una clave de
+idempotencia confirmada. **No se puede afirmar entrega exactamente una vez.**
+Lo que sí está garantizado es que un evento con entrega ya registrada no
+vuelve a enviarse nunca.

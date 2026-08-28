@@ -80,7 +80,18 @@ create table if not exists public.conversation_messages (
   -- Id del mensaje en WhatsApp, cuando existe. Evita duplicar un turno si el
   -- mismo evento se reprocesa.
   message_id     text,
-  created_at     timestamptz not null default now()
+  -- Qué decisión produjo un turno nuestro: 'reply' o 'clarify'.
+  --
+  -- Es lo único que permite saber si el último mensaje del negocio fue una
+  -- aclaración y, por tanto, si se puede pedir otra. Sin esta columna,
+  -- clarifyAllowed no se puede calcular a partir de datos persistidos.
+  -- Siempre NULL en los turnos del cliente.
+  business_action text,
+  created_at     timestamptz not null default now(),
+  constraint conversation_messages_business_action_ck check (
+    (role = 'business' and business_action in ('reply', 'clarify'))
+    or (role = 'customer' and business_action is null)
+  )
 );
 
 comment on table public.conversation_messages is
